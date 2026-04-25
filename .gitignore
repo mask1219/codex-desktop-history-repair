@@ -1,5 +1,6 @@
 .DS_Store
 .local/
 app-backups/
+docs/
 __pycache__/
 *.pyc
