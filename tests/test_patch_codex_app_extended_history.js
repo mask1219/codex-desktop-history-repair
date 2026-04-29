@@ -47,6 +47,9 @@ function buildPatchedFixtureFiles() {
       "persistExtendedHistory:!0",
       "sortKey:this.sortKey,modelProviders:[],useStateDbOnly:!0",
       "let r=[],i=async a=>{let o=await e.sendRequest(`thread/list`,{limit:200,cursor:a,sortKey:e.recentConversationsSortKey,modelProviders:t,useStateDbOnly:!0,archived:n});r.push(...o.data),o.nextCursor&&await i(o.nextCursor)};return await i(),r",
+      "C=n??c?.settings.model??null,w=await e.buildNewConversationParams",
+      "modelProvider:null,serviceTier",
+      "config:null,",
     ].join("\n"),
     ".vite/build/workspace-root-drop-handler-random.js": [
       "sortKey:`updated_at`,modelProviders:[],useStateDbOnly:!0",
@@ -94,6 +97,67 @@ test("content fallback finds multi-pattern patches after hashed filenames change
   const buffer = fs.readFileSync(asarPath);
   const { header, dataOffset } = readAsarHeader(buffer);
   const matches = findPatchTargets(buffer, header, dataOffset, patches[2]);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, "random/renamed-bundle.js");
+});
+
+test("content fallback finds current app-server sourceKinds symbol", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "history-repair-patch-source-kinds-"));
+  const asarPath = path.join(tmpDir, "app.asar");
+  writeFakeAsar(asarPath, {
+    "random/renamed-bundle.js": "sortKey:this.sortKey,modelProviders:null,archived:!1,sourceKinds:T",
+  });
+
+  const buffer = fs.readFileSync(asarPath);
+  const { header, dataOffset } = readAsarHeader(buffer);
+  const matches = findPatchTargets(buffer, header, dataOffset, patches[2]);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, "random/renamed-bundle.js");
+});
+
+test("content fallback finds resume model preference patch", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "history-repair-patch-resume-model-"));
+  const asarPath = path.join(tmpDir, "app.asar");
+  writeFakeAsar(asarPath, {
+    "random/renamed-bundle.js":
+      "C=n??l?.latestCollaborationMode.settings.model??c?.settings.model??null,w=await e.buildNewConversationParams",
+  });
+
+  const buffer = fs.readFileSync(asarPath);
+  const { header, dataOffset } = readAsarHeader(buffer);
+  const matches = findPatchTargets(buffer, header, dataOffset, patches[5]);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, "random/renamed-bundle.js");
+});
+
+test("content fallback finds resume provider patch", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "history-repair-patch-resume-provider-"));
+  const asarPath = path.join(tmpDir, "app.asar");
+  writeFakeAsar(asarPath, {
+    "random/renamed-bundle.js": "modelProvider:w.modelProvider,serviceTier",
+  });
+
+  const buffer = fs.readFileSync(asarPath);
+  const { header, dataOffset } = readAsarHeader(buffer);
+  const matches = findPatchTargets(buffer, header, dataOffset, patches[6]);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, "random/renamed-bundle.js");
+});
+
+test("content fallback finds resume config patch", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "history-repair-patch-resume-config-"));
+  const asarPath = path.join(tmpDir, "app.asar");
+  writeFakeAsar(asarPath, {
+    "random/renamed-bundle.js": "config:w.config,",
+  });
+
+  const buffer = fs.readFileSync(asarPath);
+  const { header, dataOffset } = readAsarHeader(buffer);
+  const matches = findPatchTargets(buffer, header, dataOffset, patches[7]);
 
   assert.equal(matches.length, 1);
   assert.equal(matches[0].file, "random/renamed-bundle.js");

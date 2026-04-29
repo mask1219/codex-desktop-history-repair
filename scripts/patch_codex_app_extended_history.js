@@ -45,7 +45,9 @@ const patches = [
     from: [
       "sortKey:this.sortKey,modelProviders:null,useStateDbOnly:!0",
       "sortKey:this.sortKey,modelProviders:null,archived:!1,sourceKinds:w",
+      "sortKey:this.sortKey,modelProviders:null,archived:!1,sourceKinds:T",
       "sortKey:this.sortKey,useStateDbOnly:!0  ,archived:!1,sourceKinds:w",
+      "sortKey:this.sortKey,useStateDbOnly:!0  ,archived:!1,sourceKinds:T",
     ],
     to: "sortKey:this.sortKey,modelProviders:[],useStateDbOnly:!0",
   },
@@ -64,10 +66,35 @@ const patches = [
     name: "thread-list-all-state-db",
     file: "webview/assets/app-server-manager-signals-BxR9wXcg.js",
     filePattern: /^webview\/assets\/app-server-manager-signals-.*\.js$/,
-    from:
+    from: [
       "let r=[],i=async a=>{let o=await e.sendRequest(`thread/list`,{limit:200,cursor:a,sortKey:e.recentConversationsSortKey,modelProviders:t,sourceKinds:w,archived:n});r.push(...o.data),o.nextCursor&&await i(o.nextCursor)};return await i(null),r",
+      "let r=[],i=async a=>{let o=await e.sendRequest(`thread/list`,{limit:200,cursor:a,sortKey:e.recentConversationsSortKey,modelProviders:t,sourceKinds:T,archived:n});r.push(...o.data),o.nextCursor&&await i(o.nextCursor)};return await i(null),r",
+    ],
     to:
       "let r=[],i=async a=>{let o=await e.sendRequest(`thread/list`,{limit:200,cursor:a,sortKey:e.recentConversationsSortKey,modelProviders:t,useStateDbOnly:!0,archived:n});r.push(...o.data),o.nextCursor&&await i(o.nextCursor)};return await i(),r",
+  },
+  {
+    name: "resume-current-model",
+    file: "webview/assets/app-server-manager-signals-BxR9wXcg.js",
+    filePattern: /^webview\/assets\/app-server-manager-signals-.*\.js$/,
+    from:
+      "C=n??l?.latestCollaborationMode.settings.model??c?.settings.model??null,w=await e.buildNewConversationParams",
+    to:
+      "C=n??c?.settings.model??null,w=await e.buildNewConversationParams",
+  },
+  {
+    name: "resume-current-provider",
+    file: "webview/assets/app-server-manager-signals-BxR9wXcg.js",
+    filePattern: /^webview\/assets\/app-server-manager-signals-.*\.js$/,
+    from: "modelProvider:w.modelProvider,serviceTier",
+    to: "modelProvider:null,serviceTier",
+  },
+  {
+    name: "resume-load-current-config",
+    file: "webview/assets/app-server-manager-signals-BxR9wXcg.js",
+    filePattern: /^webview\/assets\/app-server-manager-signals-.*\.js$/,
+    from: "config:w.config,",
+    to: "config:null,",
   },
 ];
 
