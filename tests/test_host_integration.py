@@ -152,6 +152,29 @@ class HostIntegrationTests(unittest.TestCase):
             self.assertEqual(rows[0]["last_message_status"], "completed")
             self.assertEqual(rows[0]["last_message_preview"], "world")
 
+    def test_list_threads_hides_archived_deleted_and_removed_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "hidden_threads.db"
+            db = SessionDatabase(db_path)
+            db.apply_migrations()
+            thread_repo = ThreadRepository(db)
+            thread_repo.create_thread(thread_id="thread_active", title="Active", status="active")
+            thread_repo.create_thread(thread_id="thread_archived", title="Archived", status="archived")
+            thread_repo.create_thread(thread_id="thread_deleted", title="Deleted", status="deleted")
+            thread_repo.create_thread(thread_id="thread_removed", title="Removed", status="removed")
+            db.close()
+
+            host = DesktopSessionHost(db_path)
+            host.startup()
+            rows = host.list_threads()
+            active_rows = host.list_threads(status="active")
+            archived_rows = host.list_threads(status="archived")
+            host.close()
+
+            self.assertEqual([row["thread_id"] for row in rows], ["thread_active"])
+            self.assertEqual([row["thread_id"] for row in active_rows], ["thread_active"])
+            self.assertEqual(archived_rows, [])
+
     def test_send_returns_summary_notice_for_ui(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "summary.db"

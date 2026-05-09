@@ -1,124 +1,183 @@
 # Codex Desktop History Repair
 
-一个用于修复和保障 Codex 桌面端历史对话不丢失的项目骨架，当前主路径已经收敛为对真实 `Codex.app` 的最小补丁。
+一个用于修复 Codex 桌面端历史线程可见性与可续聊性的本地工具集。
 
-核心目标已收敛为：
-- 使用 Codex 桌面端原生 UI，不切到额外控制台
-- 用 `ccswitch` 切换第三方 API 后，App 内仍能看到全部历史对话
-- 更换 Codex 登录账号后，App 内仍能看到全部历史对话
-- 打开旧对话后可以继续发送消息
+当前主路径不再依赖修改真实 `Codex.app` 包体。仓库已移除补丁脚本，主方案改为参考 `codex-provider-sync` 的思路，直接同步 `~/.codex` 下的 provider 元数据、rollout 文件、项目缓存和 `state_5.sqlite`，让切换 provider 或账号后历史列表重新对齐。
 
-## 当前范围
+## 现在解决什么问题
 
-本项目先聚焦以下问题：
-- 切换第三方 API 后历史线程仍可见、可继续对话
-- 切换官方账号后历史线程仍可见、可继续对话
-- 升级 Codex 桌面端后可自动重打补丁，维持历史列表读取逻辑
-- 流式中断、崩溃、断网后最后一轮不会消失
+- 切换第三方 API 后，历史线程因为 `model_provider` 不一致而不显示
+- `sessions/`、`archived_sessions/`、`state_5.sqlite` 之间元数据漂移
+- `.codex-global-state.json` 项目缓存缺失导致历史所在项目不出现在桌面端列表
+- 历史存在但排在最近 50 条之外，需要诊断首屏可见性
+- 配置文件当前 provider 已切换，但旧线程仍绑在旧 provider 上
+- 线程包含 `encrypted_content` 时，跨 provider / 账号后可能只能显示，不能可靠续聊
+- 流式中断、远端链路失效后，仍需要本地历史引擎兜底继续对话
 
-## 核心原则
+## 当前主能力
+
+- `provider-status`
+  检查 `config.toml`、rollout 文件、项目缓存、`state_5.sqlite` 之间的 provider / `cwd` / 归档状态是否一致，并输出项目是否落在最近 50 条内、是否存在 `encrypted_content`
+- `provider-sync`
+  批量把 rollout 文件、项目缓存和 `state_5.sqlite` 同步到目标 provider，可选同步 `cwd`，遇到锁住的 rollout 会跳过并报告
+- `provider-switch`
+  校验目标 provider 已在 `config.toml` 声明，先改当前 provider，再同步历史元数据
+- `provider-autosync`
+  持续观察当前 `config.toml` provider，发现外部工具切换 API 后自动同步历史元数据
+- `provider-autosync-install`
+  安装 macOS LaunchAgent，让开机 / 登录后后台常驻自动同步，无需人工运行命令
+- `provider-restore`
+  从自动备份恢复 `config.toml`、`.codex-global-state.json`、`state_5.sqlite` 和被改动的 rollout 文件，可按类别跳过
+- `provider-prune-backups`
+  清理旧备份
+
+同时保留原有本地历史引擎能力：
+
+- SQLite schema 初始化与迁移
+- 线程 / 消息 / 路由 / 摘要持久化
+- `remote_chain / local_rebuild / summary_rebuild` 续聊策略
+- 流式增量写盘与中断恢复
+- JSONL 导出 / 导入恢复
+- CLI：`init / recover / export / import / list / show / send`
+
+## 设计原则
 
 1. 本地历史是唯一真相。
 2. provider、账号、`previous_response_id` 只是路由元数据。
-3. 任何失败只能产生 `partial` 或 `failed` 记录，不能导致历史整段消失。
-4. 用户必须知道哪些内容只保存在本地，哪些内容会发送给当前 provider。
+3. 展示问题优先通过同步本地 metadata 解决，而不是修改 App 包体。
+4. 同步 provider / `cwd` 不改 `updated_at`，避免人为改变桌面端最近列表排序。
+5. 任何失败只能产生 `partial` 或 `failed` 记录，不能导致历史整段消失。
 
-## 当前可用能力
+## 快速使用
 
-当前仓库保留底层 engine 和桌面端 adapter 雏形，但主路径不是重建一套历史系统。主路径是给真实 Codex.app 打开内置的 `persistExtendedHistory` 开关，并让最近线程列表优先读本地 state db，让历史继续留在 App 自己的体验里。
-
-- Codex.app 打包补丁：普通新线程和恢复线程默认 `persistExtendedHistory: true`
-- Codex.app 打包补丁：最近线程列表、项目入口最近线程列表、全部线程列表都优先走 state db
-- Codex.app 打包补丁：对需要展示跨 provider 历史的 `thread/list`，显式传 `modelProviders: []`
-- 已验证当前 Codex Desktop / app-server 语义下，`modelProviders: null` 只返回当前 provider，不会返回全部 provider
-- 2026-04-25 已在真实 Codex.app 验证：当前项目不再只显示 3 条，`custom / sub2api / openai` 历史可同时显示
-- 只读检查：确认当前 App 是否已经打开补丁
-- 自动重打补丁：通过 LaunchAgent 在 Codex.app 更新后重新应用补丁
-- SQLite schema 初始化与迁移
-- 线程/消息/路由/摘要的本地持久化
-- `remote_chain / local_rebuild / summary_rebuild` 续聊策略
-- 流式增量写盘与中断恢复收敛
-- JSONL 导出 / 导入恢复（冲突导入为线程副本）
-- CLI：`init / recover / export / import / list / show / send`
-- `Responses API` 兼容 provider 客户端（SSE / JSON 响应）
-- 宿主接线入口：`DesktopSessionHost.startup()` 自动执行 migration + recover
-
-`DesktopSessionHost.list_threads()` 额外返回面向 UI 的字段：
-- `latest_route`（provider/account/model）
-- `send_available` / `send_unavailable_reason`
-- `last_continuation_error`
-- `last_message_role` / `last_message_status` / `last_message_preview`
-
-## App 内最小方案
-
-先检查当前 Codex.app 是否已经打开扩展历史：
-
-```bash
-node scripts/patch_codex_app_extended_history.js /Applications/Codex.app --check
-```
-
-如果输出 `needsPatch: true`，执行补丁：
-
-```bash
-node scripts/patch_codex_app_extended_history.js /Applications/Codex.app
-```
-
-为了避免 Codex.app 自动更新后补丁被覆盖，安装自动重打补丁的 LaunchAgent：
-
-```bash
-sh scripts/install_codex_app_patch_launch_agent.sh /Applications/Codex.app
-```
-
-这条路径的用户体验目标是：
-- 不新增额外界面
-- 不要求用户理解 provider / route / SQLite
-- 切换 `ccswitch`、第三方 API 或登录账号后，Codex.app 原生历史列表仍显示历史
-- 从历史列表打开旧对话后，可以继续发送消息
-
-当前补丁脚本已经内置一个关键兼容处理：
-- 在当前 Codex Desktop / app-server 版本里，`thread/list` 只有在 `modelProviders: []` 时才会返回全部 provider 历史；传 `null` 只会拿到当前 provider 的线程
-
-## Engine / CLI 备用方案
-
-CLI 只作为底层 engine 的调试、导出导入能力保留。它不是当前核心需求的默认体验，也不提供本地网页控制台。
-
-桌面端也可以直接创建 adapter 并执行 `startup()`，后续线程列表、详情和发送都通过同一个 adapter 访问本地历史库：
-
-```python
-from history_repair import DesktopHistoryAdapter, DesktopProviderConfig
-
-adapter = DesktopHistoryAdapter("/path/to/history.db")
-startup = adapter.startup()
-threads = adapter.list_threads()
-detail = adapter.get_thread("thread-id")
-
-send_result = adapter.send_text_message(
-    thread_id="thread-id",
-    message="继续",
-    provider_config=DesktopProviderConfig(
-        provider="provider-a",
-        account_id="acc-1",
-        model="gpt-5.4",
-        base_url="https://api.example.com/v1",
-        api_key="sk-xxx",
-    ),
-)
-```
-
-底层 adapter 接入要求：
-- 应用启动早期必须调用 `startup()`，它会执行 migration 和流式中断恢复。
-- 线程列表和详情页使用 `list_threads()` / `get_thread()` 的返回值，不再依赖远端历史查询决定是否展示。
-- provider、账号或模型切换时保持同一个 `thread_id`，只替换 `DesktopProviderConfig`。
-- 当返回 `send_available=false` 或 `read_only_mode=true` 时，UI 需要禁用发送并展示 `send_unavailable_reason` 或错误信息。
-- 外部桌面端更新时不得删除或重建 `$APP_DATA/history-repair/history.db`，也不要把数据库放进应用安装目录。
-
-## CLI 快速使用
-
-先在项目根目录安装本地包：
+先安装本地包：
 
 ```bash
 python3 -m pip install -e .
 ```
+
+查看当前 provider 与历史元数据偏差：
+
+```bash
+python3 -m history_repair provider-status
+```
+
+只预览把历史同步到当前 `config.toml` provider 会改什么：
+
+```bash
+python3 -m history_repair provider-sync --dry-run
+```
+
+实际同步到当前 provider：
+
+```bash
+python3 -m history_repair provider-sync
+```
+
+常驻自动同步。适合你用 Codex App 或其他工具切 API，工具会按当前 `config.toml` provider 自动追平历史：
+
+```bash
+python3 -m history_repair provider-autosync --quiet
+```
+
+安装后台自动同步。之后每次登录 macOS 后会常驻检测当前 `config.toml` provider，并自动把历史同步到当前 API：
+
+```bash
+python3 -m history_repair provider-autosync-install
+```
+
+查看后台同步状态：
+
+```bash
+python3 -m history_repair provider-autosync-status
+```
+
+卸载后台同步：
+
+```bash
+python3 -m history_repair provider-autosync-uninstall
+```
+
+如果你希望它根据最新会话实际写入的 provider，主动反写 `config.toml`，再同步历史：
+
+```bash
+python3 -m history_repair provider-autosync --switch-provider --once
+```
+
+也可以把这种模式装成后台服务，但一般只建议你明确需要“根据最新历史反向改 `config.toml`”时使用：
+
+```bash
+python3 -m history_repair provider-autosync-install --switch-provider
+```
+
+也可以显式指定目标 provider：
+
+```bash
+python3 -m history_repair provider-autosync --provider sub2api --switch-provider --once
+```
+
+只检查一次，适合放到切换 API 后的脚本里：
+
+```bash
+python3 -m history_repair provider-autosync --once
+```
+
+切换到一个新 provider，并同步历史：
+
+```bash
+python3 -m history_repair provider-switch --provider sub2api
+```
+
+如果还要同时切模型：
+
+```bash
+python3 -m history_repair provider-switch --provider sub2api --model gpt-5.5
+```
+
+只同步某几个线程：
+
+```bash
+python3 -m history_repair provider-sync --provider sub2api --thread-id thread-1 --thread-id thread-2
+```
+
+从备份恢复：
+
+```bash
+python3 -m history_repair provider-restore --backup-dir ~/.codex/backups_provider_sync/20260508231031
+```
+
+只恢复数据库和 rollout，不恢复配置与项目缓存：
+
+```bash
+python3 -m history_repair provider-restore --backup-dir ~/.codex/backups_provider_sync/20260508231031 --no-config --no-global-state
+```
+
+清理旧备份，只保留最近 10 份：
+
+```bash
+python3 -m history_repair provider-prune-backups --keep 10
+```
+
+## 备份策略
+
+执行 `provider-sync` 或 `provider-switch` 时，只要发生写入，都会自动备份：
+
+- `~/.codex/config.toml`
+- `~/.codex/state_5.sqlite`
+- `~/.codex/state_5.sqlite-wal`
+- `~/.codex/state_5.sqlite-shm`
+- `~/.codex/.codex-global-state.json`
+- 本次要修改的 rollout 文件
+
+备份目录默认在：
+
+```text
+~/.codex/backups_provider_sync/<timestamp>/
+```
+
+## 本地历史引擎用法
+
+如果你还需要调试底层续聊引擎，原有 CLI 仍然可用：
 
 ```bash
 python3 -m history_repair init --db /tmp/history.db
@@ -128,12 +187,12 @@ python3 -m history_repair import --db /tmp/history.db --input /tmp/history.jsonl
 python3 -m history_repair list --db /tmp/history.db
 python3 -m history_repair show --db /tmp/history.db --thread-id t1
 python3 -m history_repair send --db /tmp/history.db --thread-id t1 --message "继续" --provider provider-a --account-id acc-1 --model gpt-5.4 --base-url https://api.example.com/v1 --api-key sk-xxx
-# 或者通过环境变量提供 API Key（默认读取 HISTORY_REPAIR_API_KEY）
-HISTORY_REPAIR_API_KEY=sk-xxx python3 -m history_repair send --db /tmp/history.db --thread-id t1 --message "继续" --provider provider-a --account-id acc-1 --model gpt-5.4 --base-url https://api.example.com/v1
 ```
 
 也可以使用安装后的命令：
 
 ```bash
-history-repair list --db /tmp/history.db
+history-repair provider-status
+history-repair provider-switch --provider sub2api
+history-repair provider-autosync --quiet
 ```

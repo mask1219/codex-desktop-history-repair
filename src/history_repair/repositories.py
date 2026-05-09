@@ -7,6 +7,9 @@ from .models import MessageStatus
 from .utils import new_id, now_ms
 
 
+HIDDEN_THREAD_STATUSES = ("archived", "deleted", "removed")
+
+
 def _to_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
@@ -20,8 +23,10 @@ class ThreadRepository:
         return dict(row) if row else None
 
     def list_threads(self) -> list[dict[str, Any]]:
+        placeholders = ", ".join("?" for _ in HIDDEN_THREAD_STATUSES)
         rows = self.db.query_all(
-            "SELECT * FROM threads WHERE status != 'deleted' ORDER BY updated_at DESC"
+            f"SELECT * FROM threads WHERE status NOT IN ({placeholders}) ORDER BY updated_at DESC",
+            HIDDEN_THREAD_STATUSES,
         )
         return [dict(row) for row in rows]
 

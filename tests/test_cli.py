@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import plistlib
 import sqlite3
 import tempfile
 import unittest
@@ -11,9 +13,12 @@ import sys
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from history_repair import MessageRepository, MessageStatus, SessionDatabase, StreamEvent, ThreadRepository  # noqa: E402
+from history_repair.autosync_agent import AutosyncLaunchAgent  # noqa: E402
 from history_repair.cli import main  # noqa: E402
+from test_provider_sync import _init_db, _insert_thread, _write_config, _write_rollout  # noqa: E402
 
 
 class CliTests(unittest.TestCase):
@@ -108,6 +113,290 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["command"], "import")
             self.assertEqual(payload["imported_threads"], 1)
             self.assertEqual(payload["imported_messages"], 1)
+
+    def test_provider_autosync_once_syncs_to_current_config_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-auto.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                rollout_path,
+                thread_id="thread-auto",
+                provider="openai",
+                cwd="/tmp/project-auto",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-auto",
+                rollout_path=str(rollout_path),
+                provider="openai",
+                cwd="/tmp/project-auto",
+                archived=False,
+            )
+            _write_config(codex_home / "config.toml", current="sub2api", providers=["openai", "sub2api"])
+
+            code, payload = self._run_cli(
+                [
+                    "provider-autosync",
+                    "--codex-home",
+                    str(codex_home),
+                    "--once",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["command"], "provider-autosync")
+            self.assertEqual(payload["event"], "sync")
+            self.assertEqual(payload["target_provider"], "sub2api")
+            self.assertEqual(payload["updated_rollouts"], 1)
+            self.assertEqual(payload["updated_db_rows"], 1)
+
+            first_line = rollout_path.read_text(encoding="utf-8").splitlines()[0]
+            self.assertEqual(json.loads(first_line)["payload"]["model_provider"], "sub2api")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT model_provider FROM threads WHERE id = ?",
+                ("thread-auto",),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "sub2api")
+
+    def test_provider_autosync_once_can_switch_config_to_target_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-switch.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                rollout_path,
+                thread_id="thread-switch",
+                provider="openai",
+                cwd="/tmp/project-switch",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-switch",
+                rollout_path=str(rollout_path),
+                provider="openai",
+                cwd="/tmp/project-switch",
+                archived=False,
+            )
+            _write_config(codex_home / "config.toml", current="openai", providers=["openai", "sub2api"])
+
+            code, payload = self._run_cli(
+                [
+                    "provider-autosync",
+                    "--codex-home",
+                    str(codex_home),
+                    "--provider",
+                    "sub2api",
+                    "--switch-provider",
+                    "--once",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["command"], "provider-autosync")
+            self.assertEqual(payload["event"], "switch")
+            self.assertEqual(payload["current_provider"], "openai")
+            self.assertEqual(payload["target_provider"], "sub2api")
+            self.assertTrue(payload["config_updated"])
+            self.assertIsNotNone(payload["sync"])
+            self.assertEqual(payload["sync"]["target_provider"], "sub2api")
+            self.assertEqual(payload["sync"]["updated_rollouts"], 1)
+            self.assertEqual(payload["sync"]["updated_db_rows"], 1)
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "sub2api"', config_text)
+
+            first_line = rollout_path.read_text(encoding="utf-8").splitlines()[0]
+            self.assertEqual(json.loads(first_line)["payload"]["model_provider"], "sub2api")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT model_provider FROM threads WHERE id = ?",
+                ("thread-switch",),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "sub2api")
+
+    def test_provider_autosync_once_can_infer_latest_history_provider_when_switching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            old_rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-old.jsonl"
+            latest_rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-latest.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                old_rollout_path,
+                thread_id="thread-old",
+                provider="openai",
+                cwd="/tmp/project-switch",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-old",
+                rollout_path=str(old_rollout_path),
+                provider="openai",
+                cwd="/tmp/project-switch",
+                archived=False,
+                updated_at_ms=1000,
+            )
+            _write_rollout(
+                latest_rollout_path,
+                thread_id="thread-latest",
+                provider="custom",
+                cwd="/tmp/project-switch",
+            )
+            os.utime(old_rollout_path, (1, 1))
+            os.utime(latest_rollout_path, (3, 3))
+            _insert_thread(
+                db_path,
+                thread_id="thread-latest",
+                rollout_path=str(latest_rollout_path),
+                provider="custom",
+                cwd="/tmp/project-switch",
+                archived=False,
+                updated_at_ms=2000,
+            )
+            _write_config(codex_home / "config.toml", current="openai", providers=["openai"])
+
+            code, payload = self._run_cli(
+                [
+                    "provider-autosync",
+                    "--codex-home",
+                    str(codex_home),
+                    "--switch-provider",
+                    "--once",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["command"], "provider-autosync")
+            self.assertEqual(payload["event"], "switch")
+            self.assertEqual(payload["current_provider"], "openai")
+            self.assertEqual(payload["target_provider"], "custom")
+            self.assertEqual(payload["inferred_provider"], "custom")
+            self.assertTrue(payload["config_updated"])
+            self.assertEqual(payload["sync"]["target_provider"], "custom")
+            self.assertEqual(payload["sync"]["updated_rollouts"], 1)
+            self.assertEqual(payload["sync"]["updated_db_rows"], 2)
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "custom"', config_text)
+            self.assertIn("[model_providers.custom]", config_text)
+            self.assertIn('name = "custom"', config_text)
+            first_line = old_rollout_path.read_text(encoding="utf-8").splitlines()[0]
+            self.assertEqual(json.loads(first_line)["payload"]["model_provider"], "custom")
+            conn = sqlite3.connect(db_path)
+            rows = conn.execute(
+                "SELECT DISTINCT model_provider FROM threads ORDER BY model_provider",
+            ).fetchall()
+            conn.close()
+            self.assertEqual(rows, [("custom",)])
+
+    def test_provider_autosync_once_repairs_missing_inferred_provider_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-custom.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                rollout_path,
+                thread_id="thread-custom",
+                provider="custom",
+                cwd="/tmp/project-switch",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-custom",
+                rollout_path=str(rollout_path),
+                provider="custom",
+                cwd="/tmp/project-switch",
+                archived=False,
+            )
+            _write_config(codex_home / "config.toml", current="custom", providers=["sub2api"])
+
+            code, payload = self._run_cli(
+                [
+                    "provider-autosync",
+                    "--codex-home",
+                    str(codex_home),
+                    "--switch-provider",
+                    "--once",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["event"], "switch")
+            self.assertEqual(payload["target_provider"], "custom")
+            self.assertTrue(payload["config_updated"])
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "custom"', config_text)
+            self.assertIn("[model_providers.custom]", config_text)
+            self.assertIn('name = "custom"', config_text)
+
+    def test_autosync_launch_agent_install_writes_plist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            codex_home = tmp_path / "codex-home"
+            launch_agents = tmp_path / "LaunchAgents"
+            agent = AutosyncLaunchAgent(codex_home=codex_home, launch_agents_dir=launch_agents)
+
+            with patch("history_repair.cli.AutosyncLaunchAgent", return_value=agent):
+                code, payload = self._run_cli(
+                    [
+                        "provider-autosync-install",
+                        "--codex-home",
+                        str(codex_home),
+                        "--interval-sec",
+                        "2",
+                        "--no-load",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["command"], "provider-autosync-install")
+            self.assertTrue(payload["installed"])
+            self.assertIsNone(payload["loaded"])
+            self.assertTrue(Path(payload["plist_path"]).exists())
+
+            plist_payload = plistlib.loads(Path(payload["plist_path"]).read_bytes())
+            command = plist_payload["ProgramArguments"]
+            self.assertIn("provider-autosync", command)
+            self.assertIn("--quiet", command)
+            self.assertIn("--codex-home", command)
+            self.assertIn(str(codex_home.resolve()), command)
+            self.assertNotIn("--switch-provider", command)
+            self.assertTrue(plist_payload["RunAtLoad"])
+            self.assertTrue(plist_payload["KeepAlive"])
+
+    def test_autosync_launch_agent_install_can_enable_switch_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            codex_home = tmp_path / "codex-home"
+            launch_agents = tmp_path / "LaunchAgents"
+            agent = AutosyncLaunchAgent(codex_home=codex_home, launch_agents_dir=launch_agents)
+
+            with patch("history_repair.cli.AutosyncLaunchAgent", return_value=agent):
+                code, payload = self._run_cli(
+                    [
+                        "provider-autosync-install",
+                        "--codex-home",
+                        str(codex_home),
+                        "--provider",
+                        "sub2api",
+                        "--switch-provider",
+                        "--no-load",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            command = payload["program_arguments"]
+            self.assertIn("--provider", command)
+            self.assertIn("sub2api", command)
+            self.assertIn("--switch-provider", command)
 
     def test_send_command_uses_provider_and_persists_messages(self):
         class FakeProviderClient:
