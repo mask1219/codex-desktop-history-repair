@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -9,6 +10,12 @@ import sqlite3
 import time
 import tomllib
 from typing import Any
+
+WRITE_OPERATION_TIMEOUT_SECONDS = 0.5
+WRITE_LOCK_RETRY_LIMIT = 40
+WRITE_LOCK_RETRY_DELAY_SECONDS = 0.25
+FILE_REPLACE_RETRY_LIMIT = 20
+FILE_REPLACE_RETRY_DELAY_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,7 @@ class SyncPreviewItem:
 class StatusReport:
     codex_home: str
     current_provider: str | None
+    current_provider_source: str | None
     total_rollouts: int
     total_db_threads: int
     matched_threads: int
@@ -332,11 +340,33 @@ class CodexProviderSyncService:
         )
 
     def current_provider(self) -> str | None:
+        provider, _ = self.current_provider_with_source()
+        return provider
+
+    def current_provider_with_source(self) -> tuple[str | None, str | None]:
         if not self.config_path.exists():
-            return None
-        data = tomllib.loads(self.config_path.read_text(encoding="utf-8"))
-        provider = data.get("model_provider")
-        return str(provider) if provider else None
+            config_provider = None
+        else:
+            data = tomllib.loads(self.config_path.read_text(encoding="utf-8"))
+            provider = data.get("model_provider")
+            config_provider = str(provider) if provider else None
+        if config_provider:
+            return config_provider, "config.toml"
+
+        auth_mode = self._auth_mode()
+        provider_counts = self._provider_counts()
+        if auth_mode == "chatgpt":
+            if not provider_counts or "openai" in provider_counts:
+                return "openai", "auth.json"
+
+        recent_provider = self.latest_history_provider()
+        if recent_provider:
+            return recent_provider, "recent_thread"
+
+        if len(provider_counts) == 1:
+            return next(iter(provider_counts)), "only_database_provider"
+
+        return None, None
 
     def latest_history_provider(self) -> str | None:
         candidates: list[tuple[int, str]] = []
@@ -367,7 +397,8 @@ class CodexProviderSyncService:
     ) -> StatusReport:
         rollouts = self._load_rollouts()
         rows = self._load_thread_rows()
-        target = target_provider or self.current_provider()
+        current_provider, current_provider_source = self.current_provider_with_source()
+        target = target_provider or current_provider
         workspace_roots = _workspace_roots_from_rows(rows.values())
         global_state = self._load_global_state()
         missing_workspace_roots = _missing_workspace_roots(global_state, workspace_roots)
@@ -417,6 +448,7 @@ class CodexProviderSyncService:
         return StatusReport(
             codex_home=str(self.codex_home),
             current_provider=target,
+            current_provider_source=current_provider_source if target_provider is None else "argument",
             total_rollouts=len(rollouts),
             total_db_threads=len(rows),
             matched_threads=matched,
@@ -916,16 +948,20 @@ class CodexProviderSyncService:
         return items
 
     def _rewrite_rollout(self, file_path: Path, *, provider: str, cwd: str | None) -> None:
-        lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        first_payload = json.loads(lines[0])
+        text = file_path.read_text(encoding="utf-8")
+        first_line, ending, remainder = _split_first_line(text)
+        first_payload = json.loads(first_line)
         meta = dict(first_payload.get("payload", {}))
         meta["model_provider"] = provider
         if cwd is not None:
             meta["cwd"] = cwd
         first_payload["payload"] = meta
-        newline = "\n" if lines[0].endswith("\n") else ""
-        lines[0] = json.dumps(first_payload, ensure_ascii=False, separators=(",", ":")) + newline
-        file_path.write_text("".join(lines), encoding="utf-8")
+        updated_first_line = json.dumps(first_payload, ensure_ascii=False, separators=(",", ":"))
+        if ending:
+            updated_text = updated_first_line + ending + remainder
+        else:
+            updated_text = updated_first_line
+        _write_text_atomic_with_retry(file_path, updated_text)
 
     def _update_thread_rows(
         self,
@@ -934,37 +970,92 @@ class CodexProviderSyncService:
         target_provider: str,
         target_cwd: str | None,
     ) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            with conn:
-                for item in items:
-                    assignments = [
-                        ("model_provider", target_provider),
-                        ("archived", 1 if item.rollout_archived else 0),
-                    ]
-                    if item.rollout_path is not None:
-                        assignments.append(("rollout_path", item.rollout_path))
-                    if target_cwd is not None:
-                        assignments.append(("cwd", target_cwd))
-                    clause = ", ".join(f"{column} = ?" for column, _ in assignments)
-                    values = [value for _, value in assignments]
-                    values.append(item.thread_id)
-                    conn.execute(f"UPDATE threads SET {clause} WHERE id = ?", values)
-        finally:
-            conn.close()
+        self._run_db_write_with_retry(
+            lambda conn: self._update_thread_rows_with_connection(
+                conn,
+                items=items,
+                target_provider=target_provider,
+                target_cwd=target_cwd,
+            )
+        )
+
+    def _update_thread_rows_with_connection(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        items: list[SyncPreviewItem],
+        target_provider: str,
+        target_cwd: str | None,
+    ) -> None:
+        for item in items:
+            assignments = [
+                ("model_provider", target_provider),
+                ("archived", 1 if item.rollout_archived else 0),
+            ]
+            if item.rollout_path is not None:
+                assignments.append(("rollout_path", item.rollout_path))
+            if target_cwd is not None:
+                assignments.append(("cwd", target_cwd))
+            clause = ", ".join(f"{column} = ?" for column, _ in assignments)
+            values = [value for _, value in assignments]
+            values.append(item.thread_id)
+            conn.execute(f"UPDATE threads SET {clause} WHERE id = ?", values)
 
     def _delete_thread_rows(self, thread_ids: list[str]) -> None:
         if not thread_ids:
             return
-        conn = sqlite3.connect(self.db_path)
+        self._run_db_write_with_retry(
+            lambda conn: conn.executemany(
+                "DELETE FROM threads WHERE id = ?",
+                [(thread_id,) for thread_id in thread_ids],
+            )
+        )
+
+    def _run_db_write_with_retry(self, callback: Any) -> None:
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+            conn = sqlite3.connect(self.db_path, timeout=WRITE_OPERATION_TIMEOUT_SECONDS)
+            try:
+                conn.execute(f"PRAGMA busy_timeout = {max(1, int(WRITE_OPERATION_TIMEOUT_SECONDS * 1000))}")
+                conn.execute("BEGIN IMMEDIATE")
+                callback(conn)
+                conn.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if not _is_locked_error(exc):
+                    raise
+                last_error = exc
+                if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                    raise RuntimeError(
+                        "state_5.sqlite is busy and could not acquire a write lock after retries"
+                    ) from exc
+                time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+            finally:
+                conn.close()
+        if last_error is not None:
+            raise last_error
+
+    def _auth_mode(self) -> str | None:
+        auth_path = self.codex_home / "auth.json"
+        if not auth_path.exists():
+            return None
         try:
-            with conn:
-                conn.executemany(
-                    "DELETE FROM threads WHERE id = ?",
-                    [(thread_id,) for thread_id in thread_ids],
-                )
-        finally:
-            conn.close()
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        raw_mode = payload.get("auth_mode")
+        return str(raw_mode) if raw_mode else None
+
+    def _provider_counts(self) -> dict[str, int]:
+        rows = self._load_thread_rows()
+        counts: dict[str, int] = {}
+        for row in rows.values():
+            provider = row.provider
+            if not provider:
+                continue
+            counts[provider] = counts.get(provider, 0) + 1
+        return counts
 
     def _hide_archived_rollouts(self, rollout_paths: list[Path]) -> None:
         self._move_rollouts(rollout_paths, self.hidden_archived_root)
@@ -1323,19 +1414,34 @@ def _remove_stale_workspace_roots(
 
 
 def _remove_hidden_thread_state(value: Any, hidden_thread_ids: set[str]) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _remove_hidden_thread_state(child, hidden_thread_ids)
-            for key, child in value.items()
-            if str(key) not in hidden_thread_ids
-        }
-    if isinstance(value, list):
-        return [
-            _remove_hidden_thread_state(item, hidden_thread_ids)
-            for item in value
-            if not (isinstance(item, str) and item in hidden_thread_ids)
-        ]
-    return value
+    if not isinstance(value, dict):
+        return value
+    next_state = dict(value)
+    dict_key_fields = {
+        "prompt-history",
+        "conversation-permission-settings",
+        "thread-workspace-root-hints",
+    }
+    list_value_fields = {
+        "projectless-thread-ids",
+    }
+    for field in dict_key_fields:
+        field_value = next_state.get(field)
+        if isinstance(field_value, dict):
+            next_state[field] = {
+                str(key): child
+                for key, child in field_value.items()
+                if str(key) not in hidden_thread_ids
+            }
+    for field in list_value_fields:
+        field_value = next_state.get(field)
+        if isinstance(field_value, list):
+            next_state[field] = [
+                item
+                for item in field_value
+                if not (isinstance(item, str) and item in hidden_thread_ids)
+            ]
+    return next_state
 
 
 def _rollout_thread_ids(root: Path) -> set[str]:
@@ -1347,10 +1453,35 @@ def _rollout_thread_ids(root: Path) -> set[str]:
 def _rollout_thread_ids_from_paths(paths: Any) -> set[str]:
     thread_ids: set[str] = set()
     for path in paths:
-        match = re.search(r"-(019[0-9a-f-]{33})\.jsonl$", Path(path).name)
-        if match:
-            thread_ids.add(match.group(1))
+        path_obj = Path(path)
+        thread_id = _extract_rollout_thread_id(path_obj)
+        if thread_id:
+            thread_ids.add(thread_id)
     return thread_ids
+
+
+def _extract_rollout_thread_id(path: Path) -> str | None:
+    try:
+        line = path.read_text(encoding="utf-8").splitlines()[0]
+        payload = json.loads(line)
+    except (OSError, IndexError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        meta = payload.get("payload")
+        if isinstance(meta, dict):
+            thread_id = meta.get("id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
+    match = re.search(r"rollout-(.+)\.jsonl$", path.name)
+    if not match:
+        return None
+    suffix = match.group(1)
+    parts = suffix.split("-")
+    if len(parts) >= 5:
+        candidate = "-".join(parts[-5:])
+        if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", candidate):
+            return candidate
+    return suffix or None
 
 
 def _session_index_entries_to_remove(path: Path, hidden_thread_ids: set[str]) -> list[str]:
@@ -1501,3 +1632,48 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
         seen.add(path)
         result.append(path)
     return result
+
+
+def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return (
+        "database is locked" in message
+        or "database table is locked" in message
+        or "database is busy" in message
+        or "destination database is in use" in message
+    )
+
+
+def _split_first_line(text: str) -> tuple[str, str, str]:
+    for ending in ("\r\n", "\n", "\r"):
+        index = text.find(ending)
+        if index >= 0:
+            return text[:index], ending, text[index + len(ending) :]
+    return text, "", ""
+
+
+def _write_text_atomic_with_retry(path: Path, text: str) -> None:
+    temp_path = path.with_name(f".{path.name}.provider-sync-{time.time_ns()}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        _replace_file_with_retry(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _replace_file_with_retry(source_path: Path, target_path: Path) -> None:
+    last_error: OSError | None = None
+    for attempt in range(FILE_REPLACE_RETRY_LIMIT):
+        try:
+            os.replace(source_path, target_path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32):
+                raise
+            last_error = exc
+        if attempt < FILE_REPLACE_RETRY_LIMIT - 1:
+            time.sleep(FILE_REPLACE_RETRY_DELAY_SECONDS)
+    raise RuntimeError(f"File is busy and could not be replaced: {target_path}") from last_error

@@ -120,6 +120,98 @@ def _insert_thread(
 
 
 class ProviderSyncTests(unittest.TestCase):
+    def test_status_provider_source_prefers_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            _init_db(db_path)
+            _write_config(codex_home / "config.toml", current="sub2api", providers=["sub2api"])
+            service = CodexProviderSyncService(codex_home)
+            report = service.status()
+            self.assertEqual(report.current_provider, "sub2api")
+            self.assertEqual(report.current_provider_source, "config.toml")
+
+    def test_status_provider_source_uses_auth_mode_chatgpt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            rollout_path = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-auth.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                rollout_path,
+                thread_id="thread-auth",
+                provider="openai",
+                cwd="/tmp/project-auth",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-auth",
+                rollout_path=str(rollout_path),
+                provider="openai",
+                cwd="/tmp/project-auth",
+                archived=False,
+            )
+            (codex_home / "config.toml").write_text(
+                '[model_providers.openai]\nname = "openai"\n',
+                encoding="utf-8",
+            )
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "chatgpt"}),
+                encoding="utf-8",
+            )
+
+            service = CodexProviderSyncService(codex_home)
+            report = service.status()
+            self.assertEqual(report.current_provider, "openai")
+            self.assertEqual(report.current_provider_source, "auth.json")
+
+    def test_status_provider_source_uses_recent_thread_when_config_has_no_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            old_rollout = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-old-source.jsonl"
+            new_rollout = codex_home / "sessions" / "2026" / "05" / "09" / "rollout-thread-new-source.jsonl"
+            _init_db(db_path)
+            _write_rollout(
+                old_rollout,
+                thread_id="thread-old-source",
+                provider="openai",
+                cwd="/tmp/project-source",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-old-source",
+                rollout_path=str(old_rollout),
+                provider="openai",
+                cwd="/tmp/project-source",
+                archived=False,
+                updated_at_ms=1000,
+            )
+            _write_rollout(
+                new_rollout,
+                thread_id="thread-new-source",
+                provider="custom",
+                cwd="/tmp/project-source",
+            )
+            _insert_thread(
+                db_path,
+                thread_id="thread-new-source",
+                rollout_path=str(new_rollout),
+                provider="custom",
+                cwd="/tmp/project-source",
+                archived=False,
+                updated_at_ms=2000,
+            )
+            (codex_home / "config.toml").write_text(
+                '[model_providers.openai]\nname = "openai"\n',
+                encoding="utf-8",
+            )
+
+            service = CodexProviderSyncService(codex_home)
+            report = service.status()
+            self.assertEqual(report.current_provider, "custom")
+            self.assertEqual(report.current_provider_source, "recent_thread")
+
     def test_status_reports_provider_and_cwd_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp)
@@ -584,6 +676,67 @@ class ProviderSyncTests(unittest.TestCase):
             session_index = (codex_home / "session_index.jsonl").read_text(encoding="utf-8")
             self.assertNotIn(hidden_id, session_index)
             self.assertIn(active_id, session_index)
+
+    def test_hide_stale_workspaces_keeps_non_thread_id_keys_in_global_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            _init_db(db_path)
+            service = CodexProviderSyncService(codex_home)
+            hidden_id = "019dba88-d605-7a63-af50-8b1103cccfe2"
+            hidden_rollout = service.hidden_archived_root / f"rollout-2026-04-23T21-30-23-{hidden_id}.jsonl"
+            _write_rollout(hidden_rollout, thread_id=hidden_id, provider="openai", cwd=str(codex_home))
+            _insert_thread(
+                db_path,
+                thread_id=hidden_id,
+                rollout_path=str(hidden_rollout),
+                provider="openai",
+                cwd=str(codex_home),
+                archived=False,
+            )
+            (codex_home / ".codex-global-state.json").write_text(
+                json.dumps(
+                    {
+                        "prompt-history": {hidden_id: ["hidden prompt"]},
+                        "custom-mapping": {
+                            hidden_id: {"should_stay": True},
+                            "other-key": {"ok": True},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service.hide_stale_workspaces(dry_run=False)
+            global_state = json.loads((codex_home / ".codex-global-state.json").read_text(encoding="utf-8"))
+            self.assertNotIn(hidden_id, global_state["prompt-history"])
+            self.assertIn(hidden_id, global_state["custom-mapping"])
+            self.assertIn("other-key", global_state["custom-mapping"])
+
+    def test_hide_stale_workspaces_parses_hidden_thread_ids_from_rollout_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            _init_db(db_path)
+            service = CodexProviderSyncService(codex_home)
+            hidden_id = "thread-hidden-custom-format"
+            hidden_rollout = service.hidden_archived_root / "rollout-2026-04-23T21-30-23-random-suffix.jsonl"
+            _write_rollout(hidden_rollout, thread_id=hidden_id, provider="openai", cwd=str(codex_home))
+            _insert_thread(
+                db_path,
+                thread_id=hidden_id,
+                rollout_path=str(hidden_rollout),
+                provider="openai",
+                cwd=str(codex_home),
+                archived=False,
+            )
+
+            report = service.hide_stale_workspaces(dry_run=False)
+            self.assertEqual(report.matched_thread_ids, [hidden_id])
+            conn = sqlite3.connect(db_path)
+            row = conn.execute("SELECT id FROM threads WHERE id = ?", (hidden_id,)).fetchone()
+            conn.close()
+            self.assertIsNone(row)
 
     def test_hide_stale_workspaces_cleans_projectless_ids_when_no_known_threads_remain(self):
         with tempfile.TemporaryDirectory() as tmp:

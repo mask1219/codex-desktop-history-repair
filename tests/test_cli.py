@@ -337,6 +337,45 @@ class CliTests(unittest.TestCase):
             self.assertIn("[model_providers.custom]", config_text)
             self.assertIn('name = "custom"', config_text)
 
+    def test_provider_autosync_once_does_not_cleanup_stale_workspaces_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            db_path = codex_home / "state_5.sqlite"
+            _init_db(db_path)
+            stale_root = codex_home / "Documents" / "Codex" / "2026-05-01" / "new-chat"
+            stale_root.mkdir(parents=True)
+            _insert_thread(
+                db_path,
+                thread_id="thread-stale-default-autosync",
+                rollout_path=str(codex_home / "sessions" / "rollout-thread-stale-default-autosync.jsonl"),
+                provider="openai",
+                cwd=str(stale_root),
+                archived=False,
+            )
+            _write_config(codex_home / "config.toml", current="openai", providers=["openai"])
+
+            code, payload = self._run_cli(
+                [
+                    "provider-autosync",
+                    "--codex-home",
+                    str(codex_home),
+                    "--once",
+                    "--quiet",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["command"], "provider-autosync")
+            self.assertNotEqual(payload.get("event"), "hide-stale-workspaces")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT id FROM threads WHERE id = ?",
+                ("thread-stale-default-autosync",),
+            ).fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+            self.assertTrue(stale_root.exists())
+
     def test_autosync_launch_agent_install_writes_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

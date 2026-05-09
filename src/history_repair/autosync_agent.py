@@ -44,6 +44,7 @@ class AutosyncLaunchAgent:
         *,
         interval_sec: float = 5.0,
         switch_provider: bool = False,
+        cleanup_stale_workspaces: bool = False,
         provider: str | None = None,
         load: bool = True,
     ) -> AutosyncAgentReport:
@@ -51,6 +52,7 @@ class AutosyncLaunchAgent:
             codex_home=self.codex_home,
             interval_sec=interval_sec,
             switch_provider=switch_provider,
+            cleanup_stale_workspaces=cleanup_stale_workspaces,
             provider=provider,
         )
         self.launch_agents_dir.mkdir(parents=True, exist_ok=True)
@@ -173,6 +175,7 @@ def _autosync_command(
     codex_home: Path,
     interval_sec: float,
     switch_provider: bool,
+    cleanup_stale_workspaces: bool,
     provider: str | None,
 ) -> list[str]:
     command = [
@@ -190,6 +193,8 @@ def _autosync_command(
         command.extend(["--provider", provider])
     if switch_provider:
         command.append("--switch-provider")
+    if cleanup_stale_workspaces:
+        command.append("--cleanup-stale-workspaces")
     return command
 
 

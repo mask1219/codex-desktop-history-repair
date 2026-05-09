@@ -230,6 +230,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Whether to rewrite config.toml to the target provider before syncing history",
     )
+    autosync_parser.add_argument(
+        "--cleanup-stale-workspaces",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether autosync may run stale workspace cleanup with write operations",
+    )
 
     install_autosync_parser = subparsers.add_parser("provider-autosync-install")
     install_autosync_parser.add_argument("--codex-home", default=None, help="Codex home directory")
@@ -245,6 +251,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Whether the background agent may rewrite config.toml to the inferred/provider target",
+    )
+    install_autosync_parser.add_argument(
+        "--cleanup-stale-workspaces",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether the background agent may run stale workspace cleanup with write operations",
     )
     install_autosync_parser.add_argument(
         "--load",
@@ -325,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             report = agent.install(
                 interval_sec=float(args.interval_sec),
                 switch_provider=bool(args.switch_provider),
+                cleanup_stale_workspaces=bool(args.cleanup_stale_workspaces),
                 provider=str(args.provider) if args.provider else None,
                 load=bool(args.load),
             )
@@ -412,7 +425,10 @@ def main(argv: list[str] | None = None) -> int:
             interval_sec = max(float(args.interval_sec), 0.1)
             try:
                 while True:
-                    hide_report = service.hide_stale_workspaces()
+                    cleanup_stale_workspaces = bool(args.cleanup_stale_workspaces)
+                    hide_report = service.hide_stale_workspaces(
+                        dry_run=not cleanup_stale_workspaces,
+                    )
                     status_report = service.status(limit=int(args.limit))
                     target_provider = str(args.provider) if args.provider else status_report.current_provider
                     inferred_provider = None
@@ -458,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                                 **sync_report.__dict__,
                             }
                         )
-                    elif hide_report.changed:
+                    elif cleanup_stale_workspaces and hide_report.changed:
                         _print_json(
                             {
                                 "status": "ok",
